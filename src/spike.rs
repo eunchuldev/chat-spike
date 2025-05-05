@@ -123,10 +123,10 @@ impl<const S: usize, const L: usize> SpikeDetector<S, L> {
 ///
 /// Short/long horizons reuse the same `S`/`L` parameters as `SpikeDetector`.
 #[derive(Clone)]
-pub struct ChatWindow<const S: usize, const L: usize> {
+pub struct ChatWindow<const S: usize, const L: usize, D = ()> {
     ngram_range: (usize, usize),
     last_chat_idx: u32,
-    recent_chats: Ring<ChatCache, S>,
+    recent_chats: Ring<ChatCache<D>, S>,
     next_token_id: usize,
     token_dict: HashMap<String, usize>,
     token_stats: Vec<TokenStats>,
@@ -140,12 +140,13 @@ pub struct TokenStats {
 }
 
 #[derive(Clone, Default)]
-pub struct ChatCache {
+pub struct ChatCache<D> {
     token_ids: Vec<usize>,
     chat: String,
+    data: Option<D>,
 }
 
-impl<const S: usize, const L: usize> Default for ChatWindow<S, L> {
+impl<const S: usize, const L: usize, D> Default for ChatWindow<S, L, D> {
     fn default() -> Self {
         Self {
             ngram_range: (1, 4),
@@ -158,13 +159,16 @@ impl<const S: usize, const L: usize> Default for ChatWindow<S, L> {
     }
 }
 
-impl<const S: usize, const L: usize> ChatWindow<S, L> {
+impl<const S: usize, const L: usize, D> ChatWindow<S, L, D> {
     pub fn with_ngram_range(mut self, min: usize, max: usize) -> Self {
         self.ngram_range = (min, max);
         self
     }
     /// Insert a chat line, updating token statistics.
     pub fn push(&mut self, chat: String) {
+        self.push_with_data(chat, None)
+    }
+    pub fn push_with_data(&mut self, chat: String, data: Option<D>) {
         let decay_s = 1. - 1. / (S as f64);
         let decay_l = 1. - 1. / (L as f64);
         self.last_chat_idx += 1;
@@ -193,11 +197,15 @@ impl<const S: usize, const L: usize> ChatWindow<S, L> {
             }
             stats.last_chat_idx = self.last_chat_idx;
         });
-        self.recent_chats.push(ChatCache { token_ids, chat });
+        self.recent_chats.push(ChatCache {
+            token_ids,
+            chat,
+            data,
+        });
     }
 
-    /// Return `(chat_text, score)` with the highest degree centrality.
-    pub fn summary(&self) -> Option<(&str, f64)> {
+    /// Return `(chat_text, Option<data>, score)` with the highest degree centrality.
+    pub fn summary(&self) -> Option<(&str, Option<&D>, f64)> {
         let mut uv = HashMap::<usize, f64>::new();
         for ChatCache { token_ids, .. } in self.recent_chats.iter() {
             let norm2: f64 = token_ids
@@ -214,34 +222,40 @@ impl<const S: usize, const L: usize> ChatWindow<S, L> {
         }
         self.recent_chats
             .iter()
-            .map(|ChatCache { token_ids, chat }| {
-                let norm2: f64 = token_ids
-                    .iter()
-                    .map(|&t| ((L as f64) / self.token_stats[t].count_l).ln().powi(2))
-                    .sum::<f64>()
-                    .sqrt();
-                let degree_centrality = token_ids
-                    .iter()
-                    .map(move |&t| (((L as f64) / self.token_stats[t].count_l).ln() / norm2, t))
-                    .map(|(u, t)| u * uv.get(&t).unwrap_or(&0.))
-                    .sum::<f64>()
-                    - 1.0;
-                let degree_centrality = if degree_centrality.is_nan() {
-                    0.0
-                } else {
-                    degree_centrality
-                };
-                (chat.as_str(), degree_centrality)
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Less))
+            .map(
+                |ChatCache {
+                     token_ids,
+                     chat,
+                     data,
+                 }| {
+                    let norm2: f64 = token_ids
+                        .iter()
+                        .map(|&t| ((L as f64) / self.token_stats[t].count_l).ln().powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    let degree_centrality = token_ids
+                        .iter()
+                        .map(move |&t| (((L as f64) / self.token_stats[t].count_l).ln() / norm2, t))
+                        .map(|(u, t)| u * uv.get(&t).unwrap_or(&0.))
+                        .sum::<f64>()
+                        - 1.0;
+                    let degree_centrality = if degree_centrality.is_nan() {
+                        0.0
+                    } else {
+                        degree_centrality
+                    };
+                    (chat.as_str(), data.as_ref(), degree_centrality)
+                },
+            )
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Less))
     }
 }
 
 /// Combines timestamp-based burst detection with content-based summaries.
 #[derive(Default)]
-pub struct ChatSpikeDetector<const S: usize, const L: usize> {
+pub struct ChatSpikeDetector<const S: usize, const L: usize, D = ()> {
     spike: SpikeDetector<S, L>,
-    recent_chats: ChatWindow<S, L>,
+    recent_chats: ChatWindow<S, L, D>,
 }
 
 /// High-level event emitted by `ChatSpikeDetector`.
@@ -259,7 +273,7 @@ pub enum Event<'a> {
     },
 }
 
-impl<const S: usize, const L: usize> ChatSpikeDetector<S, L> {
+impl<const S: usize, const L: usize, D> ChatSpikeDetector<S, L, D> {
     pub fn with_ngram_range(mut self, min: usize, max: usize) -> Self {
         self.recent_chats = self.recent_chats.with_ngram_range(min, max);
         self
@@ -284,6 +298,26 @@ impl<const S: usize, const L: usize> ChatSpikeDetector<S, L> {
             _ => Event::None,
         }
     }
+    pub fn update_and_detect_with_data(
+        &mut self,
+        chat: String,
+        ts: Instant,
+        data: Option<D>,
+    ) -> Event {
+        self.recent_chats.push_with_data(chat, data);
+        match self.spike.push(ts) {
+            SpikeEvent::Begin { surprise } => Event::SpikeBegin {
+                summary: self.recent_chats.summary().unwrap().0,
+                surprise,
+            },
+            SpikeEvent::End { surprise } => Event::SpikeEnd {
+                summary: self.recent_chats.summary().unwrap().0,
+                surprise,
+            },
+            _ => Event::None,
+        }
+    }
+
     pub fn current_surprise(&self) -> f64 {
         self.spike.current_surprise()
     }
@@ -315,6 +349,18 @@ mod tests {
         let summary = cw.summary();
         assert!(summary.is_some());
         assert_eq!(summary.unwrap().0, "hello world");
+    }
+
+    #[test]
+    fn chat_window_summary_with_data() {
+        let mut cw = ChatWindow::<3, 12, usize>::default();
+        cw.push_with_data("hello world".into(), Some(1));
+        cw.push_with_data("hello world".into(), Some(2));
+        cw.push_with_data("some noises".into(), Some(3));
+        let summary = cw.summary();
+        assert!(summary.is_some());
+        assert_eq!(summary.unwrap().0, "hello world");
+        assert_eq!(summary.unwrap().1, Some(&2));
     }
 
     #[test]
