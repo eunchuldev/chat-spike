@@ -25,13 +25,17 @@ fn main() {
             instant0
         };
         match ss.update_and_detect(chat.msg.clone(), instant) {
-            Event::SpikeBegin { summary, surprise } => {
+            Event::SpikeBegin {
+                summary, surprise, ..
+            } => {
                 //println!("---- spike begin!");
-                bursts.push((i, chat.ts, summary.to_owned(), surprise, true))
+                bursts.push((i, chat.ts, summary.unwrap().to_owned(), surprise, true))
             }
-            Event::SpikeEnd { summary, surprise } => {
+            Event::SpikeEnd {
+                summary, surprise, ..
+            } => {
                 //println!("---- spike end!");
-                bursts.push((i, chat.ts, summary.to_owned(), surprise, false))
+                bursts.push((i, chat.ts, summary.unwrap().to_owned(), surprise, false))
             }
             _ => (),
         };

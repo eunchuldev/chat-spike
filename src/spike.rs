@@ -260,15 +260,17 @@ pub struct ChatSpikeDetector<const S: usize, const L: usize, D = ()> {
 
 /// High-level event emitted by `ChatSpikeDetector`.
 #[derive(Clone, Copy, Default, Debug)]
-pub enum Event<'a> {
+pub enum Event<'a, D> {
     #[default]
     None,
     SpikeBegin {
-        summary: &'a str,
+        summary: Option<&'a str>,
+        data: Option<&'a D>,
         surprise: f64,
     },
     SpikeEnd {
-        summary: &'a str,
+        summary: Option<&'a str>,
+        data: Option<&'a D>,
         surprise: f64,
     },
 }
@@ -284,36 +286,33 @@ impl<const S: usize, const L: usize, D> ChatSpikeDetector<S, L, D> {
     }
 
     /// Add a chat message and return an event when a spike starts or ends.
-    pub fn update_and_detect(&mut self, chat: String, ts: Instant) -> Event {
-        self.recent_chats.push(chat);
-        match self.spike.push(ts) {
-            SpikeEvent::Begin { surprise } => Event::SpikeBegin {
-                summary: self.recent_chats.summary().unwrap().0,
-                surprise,
-            },
-            SpikeEvent::End { surprise } => Event::SpikeEnd {
-                summary: self.recent_chats.summary().unwrap().0,
-                surprise,
-            },
-            _ => Event::None,
-        }
+    pub fn update_and_detect(&mut self, chat: String, ts: Instant) -> Event<D> {
+        self.update_and_detect_with_data(chat, ts, None)
     }
     pub fn update_and_detect_with_data(
         &mut self,
         chat: String,
         ts: Instant,
         data: Option<D>,
-    ) -> Event {
+    ) -> Event<D> {
         self.recent_chats.push_with_data(chat, data);
         match self.spike.push(ts) {
-            SpikeEvent::Begin { surprise } => Event::SpikeBegin {
-                summary: self.recent_chats.summary().unwrap().0,
-                surprise,
-            },
-            SpikeEvent::End { surprise } => Event::SpikeEnd {
-                summary: self.recent_chats.summary().unwrap().0,
-                surprise,
-            },
+            SpikeEvent::Begin { surprise } => {
+                let summary = self.recent_chats.summary();
+                Event::SpikeBegin {
+                    summary: summary.map(|s| s.0),
+                    data: summary.and_then(|s| s.1),
+                    surprise,
+                }
+            }
+            SpikeEvent::End { surprise } => {
+                let summary = self.recent_chats.summary();
+                Event::SpikeEnd {
+                    summary: summary.map(|s| s.0),
+                    data: summary.and_then(|s| s.1),
+                    surprise,
+                }
+            }
             _ => Event::None,
         }
     }
