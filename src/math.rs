@@ -1,6 +1,7 @@
 use core::cmp::{Ordering, Ordering::*};
 use core::ops::{Deref, Neg};
 use statrs::distribution::{DiscreteCDF, Poisson};
+use statrs::function::erf::erfc;
 use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
 #[derive(Clone, Copy, Debug)]
@@ -50,7 +51,7 @@ pub fn neg_ln_poisson_tail(k: f64, lambda: f64) -> f64 {
     } else if k < lambda || (k - lambda).abs() <= 4. * lambda.sqrt() {
         // ---- Normal tail with continuity correction ----
         let z = (k - lambda + 0.5) / lambda.sqrt();
-        let p = 0.5 * (z * FRAC_1_SQRT_2).erfc();
+        let p = 0.5 * erfc(z * FRAC_1_SQRT_2);
         -p.max(1e-308).ln()
     } else {
         // ---- Saddle-point (Lugannani–Rice) ----

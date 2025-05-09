@@ -1,6 +1,3 @@
-#![feature(float_erf)]
-#![feature(iter_array_chunks)]
-
 pub mod math;
 pub mod ring;
 pub mod spike;
