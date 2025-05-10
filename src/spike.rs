@@ -323,6 +323,9 @@ impl<const S: usize, const L: usize, D> ChatSpikeDetector<S, L, D> {
     pub fn current_phase(&self) -> Phase {
         self.spike.phase
     }
+    pub fn last_updated_at(&self) -> Option<Instant> {
+        self.spike.last_ts
+    }
 }
 
 #[cfg(test)]
