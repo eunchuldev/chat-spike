@@ -13,18 +13,20 @@
 //!
 //! ```rust
 //! use std::time::Instant;
-//! use chat_spike::{ChatSpikeDetector, Event};
+//! use chat_spike::{ChatSpikeDetector, Event, MemoryDictionary};
 //!
+//! let mut dict = MemoryDictionary::<2>::default();
 //! let mut det = ChatSpikeDetector::<1, 2>::default()
 //!     .with_threshold(0.0, f64::INFINITY); // any activity => spike
 //!
-//! let e = det.update_and_detect("Hello 🌎".into(), Instant::now());
+//! let e = det.update_and_detect("Hello 🌎".into(), Instant::now(), &mut dict);
 //! assert!(matches!(e, Event::SpikeBegin { .. }));
 //!
 //! // Phase can be inspected without advancing time.
 //! assert!(matches!(det.current_phase(), chat_spike::Phase::InSpike));
 //! ```
 
+use crate::dict::Dictionary;
 use crate::math::neg_ln_poisson_tail;
 use crate::ring::Ring;
 use crate::text::{normalize, unique_char_ngrams};
@@ -124,24 +126,13 @@ impl<const S: usize, const L: usize> SpikeDetector<S, L> {
 /// Short/long horizons reuse the same `S`/`L` parameters as `SpikeDetector`.
 #[derive(Clone)]
 pub struct ChatWindow<const S: usize, const L: usize, D = ()> {
-    ngram_range: (usize, usize),
-    last_chat_idx: u32,
     recent_chats: Ring<ChatCache<D>, S>,
-    next_token_id: usize,
-    token_dict: HashMap<String, usize>,
-    token_stats: Vec<TokenStats>,
-}
-
-#[derive(Clone, Default)]
-pub struct TokenStats {
-    count_s: f64,
-    count_l: f64,
-    last_chat_idx: u32,
+    ngram_range: (usize, usize),
+    last_chat_idx: usize,
 }
 
 #[derive(Clone, Default)]
 pub struct ChatCache<D> {
-    token_ids: Vec<usize>,
     chat: String,
     data: Option<D>,
 }
@@ -149,104 +140,86 @@ pub struct ChatCache<D> {
 impl<const S: usize, const L: usize, D> Default for ChatWindow<S, L, D> {
     fn default() -> Self {
         Self {
+            recent_chats: Ring::default(),
             ngram_range: (1, 4),
             last_chat_idx: 0,
-            recent_chats: Ring::default(),
-            next_token_id: 0,
-            token_dict: HashMap::default(),
-            token_stats: Vec::default(),
         }
     }
 }
 
 impl<const S: usize, const L: usize, D> ChatWindow<S, L, D> {
+    /// Insert a chat line, updating token statistics.
     pub fn with_ngram_range(mut self, min: usize, max: usize) -> Self {
         self.ngram_range = (min, max);
         self
     }
-    /// Insert a chat line, updating token statistics.
     pub fn push(&mut self, chat: String) {
         self.push_with_data(chat, None)
     }
-    pub fn push_with_data(&mut self, chat: String, data: Option<D>) {
-        let decay_s = 1. - 1. / (S as f64);
-        let decay_l = 1. - 1. / (L as f64);
+    pub fn push_with_dict<DI: Dictionary>(&mut self, chat: String, dict: &mut DI) {
+        self.push_with_data_and_dict(chat, None, dict);
+    }
+    pub fn push_with_data_and_dict<DI: Dictionary>(
+        &mut self,
+        chat: String,
+        data: Option<D>,
+        dict: &mut DI,
+    ) {
         self.last_chat_idx += 1;
         let chat = normalize(&chat);
         let tokens = unique_char_ngrams(chat.as_str(), self.ngram_range.0, self.ngram_range.1);
-        let token_ids: Vec<_> = tokens
+        tokens
             .into_iter()
-            .map(|token| {
-                *self.token_dict.entry(token).or_insert_with(|| {
-                    let id = self.next_token_id;
-                    self.token_stats.push(TokenStats::default());
-                    self.next_token_id += 1;
-                    id
-                })
-            })
-            .collect();
-        token_ids.iter().for_each(|&id| {
-            let stats = &mut self.token_stats[id];
-            let num_gap = (self.last_chat_idx - stats.last_chat_idx) as f64;
-            if num_gap < 10. * L as f64 {
-                stats.count_l = stats.count_l * decay_l.powf(num_gap) + 1.;
-                stats.count_s = stats.count_s * decay_s.powf(num_gap) + 1.;
-            } else {
-                stats.count_l = 1.;
-                stats.count_s = 1.;
-            }
-            stats.last_chat_idx = self.last_chat_idx;
-        });
-        self.recent_chats.push(ChatCache {
-            token_ids,
-            chat,
-            data,
-        });
+            .for_each(|token| dict.observe(&token, self.last_chat_idx));
+        self.push_with_data(chat, data)
+    }
+    pub fn push_with_data(&mut self, chat: String, data: Option<D>) {
+        self.recent_chats.push(ChatCache { chat, data });
     }
 
     /// Return `(chat_text, Option<data>, score)` with the highest degree centrality.
-    pub fn summary(&self) -> Option<(&str, Option<&D>, f64)> {
-        let mut uv = HashMap::<usize, f64>::new();
-        for ChatCache { token_ids, .. } in self.recent_chats.iter() {
-            let norm2: f64 = token_ids
+    pub fn summary_with_dict<DI: Dictionary>(&self, dict: &DI) -> Option<(&str, Option<&D>, f64)> {
+        let mut uv = HashMap::<&str, f64>::new();
+        let tokenses: Vec<_> = self
+            .recent_chats
+            .iter()
+            .map(|c| unique_char_ngrams(c.chat.as_str(), self.ngram_range.0, self.ngram_range.1))
+            .collect();
+        for tokens in tokenses.iter() {
+            let norm2: f64 = tokens
                 .iter()
-                .map(|&t| ((L as f64) / self.token_stats[t].count_l).ln().powi(2))
+                .map(|t| ((L as f64) / dict.count(t).max(1.0)).ln().powi(2))
                 .sum::<f64>()
                 .sqrt();
-            for (id, u) in token_ids
+            for (id, u) in tokens
                 .iter()
-                .map(move |&t| (t, ((L as f64) / self.token_stats[t].count_l).ln() / norm2))
+                .map(|t| (t, ((L as f64) / dict.count(t).max(1.0)).ln() / norm2))
             {
                 uv.entry(id).and_modify(|v| *v += u).or_insert(u);
             }
         }
         self.recent_chats
             .iter()
-            .map(
-                |ChatCache {
-                     token_ids,
-                     chat,
-                     data,
-                 }| {
-                    let norm2: f64 = token_ids
-                        .iter()
-                        .map(|&t| ((L as f64) / self.token_stats[t].count_l).ln().powi(2))
-                        .sum::<f64>()
-                        .sqrt();
-                    let degree_centrality = token_ids
-                        .iter()
-                        .map(move |&t| (((L as f64) / self.token_stats[t].count_l).ln() / norm2, t))
-                        .map(|(u, t)| u * uv.get(&t).unwrap_or(&0.))
-                        .sum::<f64>()
-                        - 1.0;
-                    let degree_centrality = if degree_centrality.is_nan() {
-                        0.0
-                    } else {
-                        degree_centrality
-                    };
-                    (chat.as_str(), data.as_ref(), degree_centrality)
-                },
-            )
+            .zip(tokenses.iter())
+            .map(|(ChatCache { chat, data }, tokens)| {
+                let norm2: f64 = tokens
+                    .iter()
+                    .map(|t| ((L as f64) / dict.count(t).max(1.0)).ln().powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let degree_centrality = tokens
+                    .iter()
+                    .map(|t| (((L as f64) / dict.count(t).max(1.0)).ln() / norm2, t))
+                    .map(|(u, t)| u * uv.get(&t.as_str()).unwrap_or(&0.))
+                    .sum::<f64>()
+                    - 1.0;
+                let degree_centrality = if degree_centrality.is_nan() {
+                    0.0
+                } else {
+                    degree_centrality
+                };
+                (chat.as_str(), data.as_ref(), degree_centrality)
+            })
             .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Less))
     }
 }
@@ -286,19 +259,25 @@ impl<const S: usize, const L: usize, D> ChatSpikeDetector<S, L, D> {
     }
 
     /// Add a chat message and return an event when a spike starts or ends.
-    pub fn update_and_detect(&mut self, chat: String, ts: Instant) -> Event<D> {
-        self.update_and_detect_with_data(chat, ts, None)
+    pub fn update_and_detect<DI: Dictionary>(
+        &mut self,
+        chat: String,
+        ts: Instant,
+        dict: &mut DI,
+    ) -> Event<D> {
+        self.update_and_detect_with_data(chat, ts, None, dict)
     }
-    pub fn update_and_detect_with_data(
+    pub fn update_and_detect_with_data<DI: Dictionary>(
         &mut self,
         chat: String,
         ts: Instant,
         data: Option<D>,
+        dict: &mut DI,
     ) -> Event<D> {
-        self.recent_chats.push_with_data(chat, data);
+        self.recent_chats.push_with_data_and_dict(chat, data, dict);
         match self.spike.push(ts) {
             SpikeEvent::Begin { surprise } => {
-                let summary = self.recent_chats.summary();
+                let summary = self.recent_chats.summary_with_dict(dict);
                 Event::SpikeBegin {
                     summary: summary.map(|s| s.0),
                     data: summary.and_then(|s| s.1),
@@ -306,7 +285,7 @@ impl<const S: usize, const L: usize, D> ChatSpikeDetector<S, L, D> {
                 }
             }
             SpikeEvent::End { surprise } => {
-                let summary = self.recent_chats.summary();
+                let summary = self.recent_chats.summary_with_dict(dict);
                 Event::SpikeEnd {
                     summary: summary.map(|s| s.0),
                     data: summary.and_then(|s| s.1),
@@ -331,6 +310,7 @@ impl<const S: usize, const L: usize, D> ChatSpikeDetector<S, L, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dict::MemoryDictionary;
 
     #[test]
     fn spike_detector_triggers_begin() {
@@ -345,10 +325,11 @@ mod tests {
     #[test]
     fn chat_window_summary_nonempty() {
         let mut cw = ChatWindow::<3, 12>::default();
-        cw.push("hello world".into());
-        cw.push("hello world".into());
-        cw.push("some noises".into());
-        let summary = cw.summary();
+        let mut dict = MemoryDictionary::<12>::default();
+        cw.push_with_dict("hello world".into(), &mut dict);
+        cw.push_with_dict("hello world".into(), &mut dict);
+        cw.push_with_dict("some noises".into(), &mut dict);
+        let summary = cw.summary_with_dict(&dict);
         assert!(summary.is_some());
         assert_eq!(summary.unwrap().0, "hello world");
     }
@@ -356,10 +337,11 @@ mod tests {
     #[test]
     fn chat_window_summary_with_data() {
         let mut cw = ChatWindow::<3, 12, usize>::default();
-        cw.push_with_data("hello world".into(), Some(1));
-        cw.push_with_data("hello world".into(), Some(2));
-        cw.push_with_data("some noises".into(), Some(3));
-        let summary = cw.summary();
+        let mut dict = MemoryDictionary::<12>::default();
+        cw.push_with_data_and_dict("hello world".into(), Some(1), &mut dict);
+        cw.push_with_data_and_dict("hello world".into(), Some(2), &mut dict);
+        cw.push_with_data_and_dict("some noises".into(), Some(3), &mut dict);
+        let summary = cw.summary_with_dict(&dict);
         assert!(summary.is_some());
         assert_eq!(summary.unwrap().0, "hello world");
         assert_eq!(summary.unwrap().1, Some(&2));
@@ -368,8 +350,9 @@ mod tests {
     #[test]
     fn chat_spike_detector_phase_consistency() {
         let mut det = ChatSpikeDetector::<1, 2>::default().with_threshold(0.0, f64::INFINITY);
+        let mut dict = MemoryDictionary::<12>::default();
         let t0 = Instant::now();
-        let ev = det.update_and_detect("hi".into(), t0);
+        let ev = det.update_and_detect("hi".into(), t0, &mut dict);
         assert!(matches!(ev, Event::SpikeBegin { .. }));
         assert!(matches!(det.current_phase(), Phase::InSpike));
         assert!(det.current_surprise() >= 0.0);

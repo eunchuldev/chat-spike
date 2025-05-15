@@ -1,4 +1,4 @@
-use chat_spike::{ChatSpikeDetector, Event};
+use chat_spike::{ChatSpikeDetector, Event, MemoryDictionary};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -13,8 +13,9 @@ fn main() {
     let file =
         std::fs::File::open("examples/data/sample.json").expect("file should open read only");
     let chats: Vec<Chat> = serde_json::from_reader(file).expect("file should be proper JSON");
+    let mut dict = MemoryDictionary::<250>::default();
     let mut bursts = vec![];
-    let mut ss = ChatSpikeDetector::<30, 100>::default().with_threshold(2.0, 1.0);
+    let mut ss = ChatSpikeDetector::<20, 250>::default().with_threshold(2.0, 1.0);
     let mut wall0: Option<DateTime<Utc>> = None;
     let instant0 = Instant::now();
     for (i, chat) in chats.iter().enumerate() {
@@ -24,7 +25,7 @@ fn main() {
             wall0 = Some(chat.ts);
             instant0
         };
-        match ss.update_and_detect(chat.msg.clone(), instant) {
+        match ss.update_and_detect(chat.msg.clone(), instant, &mut dict) {
             Event::SpikeBegin {
                 summary, surprise, ..
             } => {
@@ -35,18 +36,18 @@ fn main() {
                 summary, surprise, ..
             } => {
                 //println!("---- spike end!");
-                bursts.push((i, chat.ts, summary.unwrap().to_owned(), surprise, false))
+                //bursts.push((i, chat.ts, summary.unwrap().to_owned(), surprise, false))
             }
             _ => (),
         };
         //println!("{:.2}~{}:{}", ss.current_surprise(), chat.ts, chat.msg);
     }
+    println!("{:?}", bursts);
     println!(
         "detect {} spikes among {} chats, {} ~ {}",
-        bursts.len() / 2,
+        bursts.len(),
         chats.len(),
         chats[0].ts,
         chats[chats.len() - 1].ts,
     );
-    //println!("{:?}", bursts);
 }
